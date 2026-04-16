@@ -260,6 +260,21 @@ func (mc *mysqlConn) auth(authData []byte, plugin string) ([]byte, error) {
 		// http://dev.mysql.com/doc/refman/5.7/en/pam-authentication-plugin.html
 		return append([]byte(mc.cfg.Passwd), 0), nil
 
+	case "authentication_openid_connect_client":
+		// StarRocks JWT authentication via OpenID Connect client plugin.
+		// Wire format: [1-byte capability] [length-encoded JWT token]
+		// The JWT token is passed in the password field of the DSN.
+		if len(mc.cfg.Passwd) == 0 {
+			return nil, fmt.Errorf("JWT token is required for authentication_openid_connect_client plugin")
+		}
+		token := []byte(mc.cfg.Passwd)
+		lenEncoded := appendLengthEncodedInteger(nil, uint64(len(token)))
+		authResp := make([]byte, 0, 1+len(lenEncoded)+len(token))
+		authResp = append(authResp, 0x01)          // capability flag
+		authResp = append(authResp, lenEncoded...) // length-encoded token length
+		authResp = append(authResp, token...)      // JWT token bytes
+		return authResp, nil
+
 	case "mysql_native_password":
 		if !mc.cfg.AllowNativePasswords {
 			return nil, ErrNativePassword
