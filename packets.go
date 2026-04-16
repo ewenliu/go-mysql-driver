@@ -310,7 +310,7 @@ func (mc *mysqlConn) writeHandshakeResponsePacket(authResp []byte, plugin string
 		clientFlags |= clientPluginAuthLenEncClientData
 	}
 
-	pktLen := 4 + 4 + 1 + 23 + len(mc.cfg.User) + 1 + len(authRespLEI) + len(authResp) + 21 + 1
+	pktLen := 4 + 4 + 1 + 23 + len(mc.cfg.User) + 1 + len(authRespLEI) + len(authResp) + len(plugin) + 1
 
 	// To specify a db name
 	if n := len(mc.cfg.DBName); n > 0 {
