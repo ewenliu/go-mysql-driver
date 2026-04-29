@@ -1328,3 +1328,104 @@ func TestAuthSwitchSHA256PasswordSecure(t *testing.T) {
 		t.Errorf("got unexpected data: %v", conn.written)
 	}
 }
+
+// authentication_openid_connect_client (MySQL 8.x Enterprise / StarRocks 3.x)
+// — JWT presented in place of the password, length-encoded, with a 1-byte
+// capability flag prefix.
+
+func TestAuthFastOpenIDConnect(t *testing.T) {
+	_, mc := newRWMockConn(1)
+	mc.cfg.User = "alice@example.com"
+	// Real Okta JWTs are several hundred bytes; use one long enough to
+	// require a multi-byte length-encoded prefix so we exercise the
+	// correct lenenc encoding (not just the 1-byte fast path).
+	jwt := bytes.Repeat([]byte("X"), 300)
+	mc.cfg.Passwd = string(jwt)
+
+	plugin := "authentication_openid_connect_client"
+	authResp, err := mc.auth(nil, plugin)
+	if err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+
+	// Expected wire format: [0x01][lenenc(len(jwt))][jwt bytes].
+	// 300 fits in 0xfc-prefixed 2-byte lenenc -> 3 lenenc bytes total.
+	if authResp[0] != 0x01 {
+		t.Errorf("capability flag = 0x%02x, want 0x01", authResp[0])
+	}
+	expectedLEI := appendLengthEncodedInteger(nil, uint64(len(jwt)))
+	if !bytes.Equal(authResp[1:1+len(expectedLEI)], expectedLEI) {
+		t.Errorf("length-encoded JWT length = %v, want %v",
+			authResp[1:1+len(expectedLEI)], expectedLEI)
+	}
+	gotJWT := authResp[1+len(expectedLEI):]
+	if !bytes.Equal(gotJWT, jwt) {
+		t.Errorf("JWT body mismatch (len=%d, want=%d)", len(gotJWT), len(jwt))
+	}
+}
+
+func TestAuthFastOpenIDConnectShortJWT(t *testing.T) {
+	// JWT short enough that lenenc is a single byte — exercises the
+	// other lenenc branch.
+	_, mc := newRWMockConn(1)
+	mc.cfg.Passwd = "short.jwt.token"
+	plugin := "authentication_openid_connect_client"
+
+	authResp, err := mc.auth(nil, plugin)
+	if err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	if authResp[0] != 0x01 {
+		t.Errorf("capability flag = 0x%02x, want 0x01", authResp[0])
+	}
+	if int(authResp[1]) != len(mc.cfg.Passwd) {
+		t.Errorf("lenenc byte = %d, want %d", authResp[1], len(mc.cfg.Passwd))
+	}
+	if !bytes.Equal(authResp[2:], []byte(mc.cfg.Passwd)) {
+		t.Errorf("JWT body mismatch: got %q", authResp[2:])
+	}
+}
+
+func TestAuthFastOpenIDConnectEmpty(t *testing.T) {
+	// Empty Passwd means the caller forgot to pass a JWT. SR FE would
+	// reject this anyway, but failing fast on the client surfaces a
+	// clearer error than the eventual "Access denied" packet.
+	_, mc := newRWMockConn(1)
+	mc.cfg.User = "alice@example.com"
+	mc.cfg.Passwd = ""
+
+	if _, err := mc.auth(nil, "authentication_openid_connect_client"); err == nil {
+		t.Fatal("expected error for empty JWT, got nil")
+	}
+}
+
+// TestWriteHandshakeResponsePacketLongPluginName guards the
+// packets.go pktLen calculation: prior to the fix, a hardcoded 21
+// (length of "mysql_native_password") meant any plugin name longer
+// than 21 bytes would either overflow the buffer or get truncated at
+// the wire. authentication_openid_connect_client is 36 bytes; this
+// test feeds it through the full write path and asserts the plugin
+// name lands intact at the tail of the packet.
+func TestWriteHandshakeResponsePacketLongPluginName(t *testing.T) {
+	conn, mc := newRWMockConn(1)
+	mc.cfg.User = "alice"
+	mc.cfg.Passwd = "jwt-token-bytes"
+
+	plugin := "authentication_openid_connect_client" // 36 bytes
+	authResp, err := mc.auth(nil, plugin)
+	if err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	if err := mc.writeHandshakeResponsePacket(authResp, plugin); err != nil {
+		t.Fatalf("writeHandshakeResponsePacket: %v", err)
+	}
+	// The packet ends with the null-terminated plugin name; locate it
+	// by suffix-match. If the buffer was too small, either the write
+	// would have panicked (slice index out of range) or the plugin
+	// bytes would be truncated.
+	expectedTail := append([]byte(plugin), 0x00)
+	if !bytes.HasSuffix(conn.written, expectedTail) {
+		t.Fatalf("plugin name not at packet tail (last 40 bytes = %v)",
+			conn.written[len(conn.written)-40:])
+	}
+}
